@@ -23,6 +23,28 @@ app.post('/call', async (req, res) => {
 
   const client = clientMap[calledNumber];
 
+  // ====== DIAGNOSTIC LOGGING (temporary, for missed-call detection design) ======
+  console.log(`--- EVENT: ${eventType} | direction: ${direction} ---`);
+  if (eventType === 'call.hangup') {
+    console.log(`HANGUP DETAILS:`);
+    console.log(`  hangup_cause: ${payload?.hangup_cause}`);
+    console.log(`  hangup_source: ${payload?.hangup_source}`);
+    console.log(`  start_time: ${payload?.start_time}`);
+    console.log(`  end_time: ${payload?.end_time}`);
+    console.log(`  from: ${payload?.from}`);
+    console.log(`  to: ${payload?.to}`);
+    if (payload?.start_time && payload?.end_time) {
+      const dur = (new Date(payload.end_time) - new Date(payload.start_time)) / 1000;
+      console.log(`  duration_seconds: ${dur}`);
+    }
+  }
+  if (eventType === 'call.answered') {
+    console.log(`ANSWERED DETAILS:`);
+    console.log(`  from: ${payload?.from}`);
+    console.log(`  to: ${payload?.to}`);
+  }
+  // ====== END DIAGNOSTIC LOGGING ======
+
   if (eventType === 'call.initiated' && direction === 'incoming') {
     if (!client) {
       console.log('No client found for number:', calledNumber);
