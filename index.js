@@ -13,7 +13,7 @@ const clientMap = {
 
 // How long after answer (in seconds) we still consider a call "missed".
 // Catches voicemail-bailers who hang up during the greeting.
-const POST_ANSWER_MISSED_THRESHOLD_SECONDS = 5;
+const POST_ANSWER_MISSED_THRESHOLD_SECONDS = 10;
 
 // Tracks each active call's state in memory while it's happening.
 // Key: call_control_id
@@ -59,7 +59,7 @@ app.post('/call', async (req, res) => {
         body: JSON.stringify({
           to: client.businessPhone,
           from: callerNumber,
-          timeout_secs: 30
+          timeout_secs: 60
         })
       });
       const result = await response.json();
