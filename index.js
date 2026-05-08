@@ -11,6 +11,15 @@ const clientMap = {
   }
 };
 
+// How long after answer (in seconds) we still consider a call "missed".
+// Catches voicemail-bailers who hang up during the greeting.
+const POST_ANSWER_MISSED_THRESHOLD_SECONDS = 5;
+
+// Tracks each active call's state in memory while it's happening.
+// Key: call_control_id
+// Value: { client, callerNumber, telnyxNumber, answered, answeredAt }
+const activeCalls = {};
+
 app.post('/call', async (req, res) => {
   res.sendStatus(200);
 
@@ -23,33 +32,20 @@ app.post('/call', async (req, res) => {
 
   const client = clientMap[calledNumber];
 
-  // ====== DIAGNOSTIC LOGGING (temporary, for missed-call detection design) ======
-  console.log(`--- EVENT: ${eventType} | direction: ${direction} ---`);
-  if (eventType === 'call.hangup') {
-    console.log(`HANGUP DETAILS:`);
-    console.log(`  hangup_cause: ${payload?.hangup_cause}`);
-    console.log(`  hangup_source: ${payload?.hangup_source}`);
-    console.log(`  start_time: ${payload?.start_time}`);
-    console.log(`  end_time: ${payload?.end_time}`);
-    console.log(`  from: ${payload?.from}`);
-    console.log(`  to: ${payload?.to}`);
-    if (payload?.start_time && payload?.end_time) {
-      const dur = (new Date(payload.end_time) - new Date(payload.start_time)) / 1000;
-      console.log(`  duration_seconds: ${dur}`);
-    }
-  }
-  if (eventType === 'call.answered') {
-    console.log(`ANSWERED DETAILS:`);
-    console.log(`  from: ${payload?.from}`);
-    console.log(`  to: ${payload?.to}`);
-  }
-  // ====== END DIAGNOSTIC LOGGING ======
-
+  // ── Incoming call: store it in memory and forward to the business ──
   if (eventType === 'call.initiated' && direction === 'incoming') {
     if (!client) {
       console.log('No client found for number:', calledNumber);
       return;
     }
+
+    activeCalls[callControlId] = {
+      client,
+      callerNumber,
+      telnyxNumber: calledNumber,
+      answered: false,
+      answeredAt: null
+    };
 
     console.log(`Incoming call for ${client.businessName} from ${callerNumber}`);
 
@@ -69,22 +65,46 @@ app.post('/call', async (req, res) => {
       const result = await response.json();
       console.log('Transfer response:', JSON.stringify(result));
     } catch (err) {
-      console.error('Transfer failed:', err?.message, JSON.stringify(err?.response?.data));
+      console.error('Transfer failed:', err?.message);
     }
   }
 
+  // ── Call was answered (by human or voicemail) — record timestamp ──
+  if (eventType === 'call.answered') {
+    if (activeCalls[callControlId]) {
+      activeCalls[callControlId].answered = true;
+      activeCalls[callControlId].answeredAt = Date.now();
+      console.log(`Call answered for leg ${callControlId}`);
+    }
+  }
+
+  // ── Call ended — decide if it was missed ──
   if (eventType === 'call.hangup') {
-    if (!client) return;
+    const callData = activeCalls[callControlId];
+    if (!callData) return; // not a call we were tracking
 
-    const answeredBy = payload?.hangup_cause;
-    const callDuration = payload?.end_time && payload?.start_time
-      ? (new Date(payload.end_time) - new Date(payload.start_time)) / 1000
-      : 0;
+    const { client: callClient, callerNumber: caller, telnyxNumber, answered, answeredAt } = callData;
 
-    const wasMissed = answeredBy === 'timeout' || callDuration < 10;
+    // Calculate how long the call lasted AFTER it was answered (if at all)
+    let postAnswerSeconds = null;
+    if (answered && answeredAt) {
+      postAnswerSeconds = (Date.now() - answeredAt) / 1000;
+    }
+
+    console.log(
+      `Call ended | answered: ${answered}` +
+      (postAnswerSeconds !== null ? ` | post-answer: ${postAnswerSeconds.toFixed(2)}s` : '') +
+      ` | hangup_cause: ${payload?.hangup_cause}`
+    );
+
+    // Missed if: never answered, OR answered but ended quickly (voicemail bailer)
+    const wasMissed =
+      !answered ||
+      (postAnswerSeconds !== null && postAnswerSeconds < POST_ANSWER_MISSED_THRESHOLD_SECONDS);
 
     if (wasMissed) {
-      console.log(`Missed call from ${callerNumber} — sending text back`);
+      const reason = !answered ? 'no answer' : `bailed after ${postAnswerSeconds.toFixed(1)}s`;
+      console.log(`Missed call from ${caller} (${reason}) — sending text-back`);
 
       try {
         const response = await fetch('https://api.telnyx.com/v2/messages', {
@@ -94,9 +114,9 @@ app.post('/call', async (req, res) => {
             'Authorization': `Bearer ${process.env.TELNYX_API_KEY}`
           },
           body: JSON.stringify({
-            from: calledNumber,
-            to: callerNumber,
-            text: `Hi, sorry we missed your call — how can we help?`
+            from: telnyxNumber,
+            to: caller,
+            text: `Hi, this is ${callClient.businessName}. Sorry we missed your call — how can we help?`
           })
         });
         const result = await response.json();
@@ -105,9 +125,13 @@ app.post('/call', async (req, res) => {
         console.error('SMS failed:', err?.message);
       }
     }
+
+    // Clean up memory once the call is done
+    delete activeCalls[callControlId];
   }
 });
 
+// Inbound SMS endpoint
 app.post('/sms', async (req, res) => {
   res.sendStatus(200);
   const payload = req.body?.data?.payload;
