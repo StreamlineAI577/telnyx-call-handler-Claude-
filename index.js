@@ -15,7 +15,7 @@ const clientMap = {
   }
 };
 
-const POST_ANSWER_MISSED_THRESHOLD_SECONDS = 10;
+const POST_ANSWER_MISSED_THRESHOLD_SECONDS = 8;
 const activeCalls = {};
 
 // ── Airtable helpers ──────────────────────────────────────────────
@@ -174,6 +174,14 @@ app.post('/call', async (req, res) => {
 
 app.post('/sms', async (req, res) => {
   res.sendStatus(200);
+  const eventType = req.body?.data?.event_type;
+  
+  // Only process actual inbound messages, ignore outbound status webhooks (message.sent, message.finalized)
+  if (eventType !== 'message.received') {
+    console.log(`Ignoring SMS event: ${eventType}`);
+    return;
+  }
+  
   const payload = req.body?.data?.payload;
   const from = payload?.from?.phone_number;
   const to = payload?.to?.[0]?.phone_number;
@@ -182,6 +190,13 @@ app.post('/sms', async (req, res) => {
 
   console.log(`Inbound SMS from ${from} to ${to}: ${messageRaw}`);
 
+  // Ignore messages sent from our own Telnyx numbers (outbound echo)
+  const ownNumbers = Object.keys(clientMap);
+  if (ownNumbers.includes(from)) {
+    console.log(`Ignoring echo from own Telnyx number ${from}`);
+    return;
+  }
+  
   try {
     const contact = await findContact(from);
     const consentStatus = contact?.fields?.consent_status;
