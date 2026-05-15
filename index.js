@@ -15,7 +15,7 @@ const clientMap = {
   }
 };
 
-const POST_ANSWER_MISSED_THRESHOLD_SECONDS = 8;
+const POST_ANSWER_MISSED_THRESHOLD_SECONDS = 10;
 const activeCalls = {};
 
 // ── Airtable helpers ──────────────────────────────────────────────
@@ -175,13 +175,13 @@ app.post('/call', async (req, res) => {
 app.post('/sms', async (req, res) => {
   res.sendStatus(200);
   const eventType = req.body?.data?.event_type;
-  
+
   // Only process actual inbound messages, ignore outbound status webhooks (message.sent, message.finalized)
   if (eventType !== 'message.received') {
     console.log(`Ignoring SMS event: ${eventType}`);
     return;
   }
-  
+
   const payload = req.body?.data?.payload;
   const from = payload?.from?.phone_number;
   const to = payload?.to?.[0]?.phone_number;
@@ -196,7 +196,12 @@ app.post('/sms', async (req, res) => {
     console.log(`Ignoring echo from own Telnyx number ${from}`);
     return;
   }
-  
+
+  // Look up which client owns the Telnyx number this text was sent to
+  // This is how we know which business name to use in our reply messages
+  const client = clientMap[to];
+  const businessName = client?.businessName || 'the business';
+
   try {
     const contact = await findContact(from);
     const consentStatus = contact?.fields?.consent_status;
@@ -210,7 +215,7 @@ app.post('/sms', async (req, res) => {
 
     // STOP — always honored, no matter their current status
     if (message === 'STOP' || message === 'UNSUBSCRIBE') {
-      await sendSMS(to, from, 'StreamlineAI: You have been unsubscribed and will receive no further messages.');
+      await sendSMS(to, from, `${businessName}: You have been unsubscribed and will receive no further messages.`);
       if (contact) {
         await updateContact(contact.id, {
           consent_status: 'opted_out',
@@ -225,7 +230,7 @@ app.post('/sms', async (req, res) => {
     // HELP — only respond if they're opted in
     if (message === 'HELP') {
       if (consentStatus === 'opted_in') {
-        await sendSMS(to, from, 'StreamlineAI: For assistance, contact us at hello@streamlineaihq.com. Reply STOP to opt out.');
+        await sendSMS(to, from, `${businessName}: For assistance, contact us at hello@streamlineaihq.com. Reply STOP to opt out.`);
         if (contact) {
           await updateContact(contact.id, { last_message_at: now });
         }
@@ -235,7 +240,7 @@ app.post('/sms', async (req, res) => {
 
     // YES / START — opt them in (only if they were pending)
     if ((message === 'YES' || message === 'START') && consentStatus === 'pending') {
-      await sendSMS(to, from, "StreamlineAI: You're now opted in. Message frequency varies. Msg & data rates may apply. Reply HELP for assistance or STOP to opt out. — How can we help you today?");
+      await sendSMS(to, from, `${businessName}: You're now opted in. Message frequency varies. Msg & data rates may apply. Reply HELP for assistance or STOP to opt out. — How can we help you today?`);
       await updateContact(contact.id, {
         consent_status: 'opted_in',
         opted_in_at: now,
