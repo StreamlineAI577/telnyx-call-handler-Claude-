@@ -76,6 +76,24 @@ async function logCall(callerPhone, telnyxNumber, clientId, status, durationSeco
   return await res.json();
 }
 
+async function logConversation(callerPhone, telnyxNumber, clientId, direction, messageText) {
+  const res = await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/Conversations`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fields: {
+        timestamp: new Date().toISOString(),
+        caller_phone: callerPhone,
+        client_id: clientId,
+        client_telnyx_number: telnyxNumber,
+        direction: direction,
+        message: messageText
+      }
+    })
+  });
+  return await res.json();
+}
+
 async function sendSMS(from, to, text) {
   const res = await fetch('https://api.telnyx.com/v2/messages', {
     method: 'POST',
@@ -142,12 +160,25 @@ app.post('/call', async (req, res) => {
         const consentStatus = contact?.fields?.consent_status;
 
         if (consentStatus === 'opted_out') {
+          // Opted out — send nothing
           console.log(`${caller} is opted out — no text sent`);
+
+        } else if (consentStatus === 'opted_in') {
+          // Already have consent — skip the consent ask, go straight to help
+          const shortMsg = `Hi, this is ${callClient.businessName}. Sorry we missed your call — how can we help you today?`;
+          await sendSMS(telnyxNumber, caller, shortMsg);
+          textSent = true;
+          console.log(`Short missed call text sent to ${caller} (already opted in)`);
+          await logConversation(caller, telnyxNumber, callClient.clientId, 'outbound', shortMsg);
+          await updateContact(contact.id, { last_message_at: new Date().toISOString() });
+
         } else {
+          // No record or pending — send full consent request
           const consentMsg = `Hi, this is ${callClient.businessName}. Sorry we missed your call — can we follow up with you here by text? Reply YES to continue or STOP to opt out.`;
           await sendSMS(telnyxNumber, caller, consentMsg);
           textSent = true;
           console.log(`Consent request sent to ${caller}`);
+          await logConversation(caller, telnyxNumber, callClient.clientId, 'outbound', consentMsg);
 
           if (!contact) {
             await createContact(caller, telnyxNumber, callClient.clientId);
@@ -198,24 +229,21 @@ app.post('/sms', async (req, res) => {
   }
 
   // Look up which client owns the Telnyx number this text was sent to
-  // This is how we know which business name to use in our reply messages
   const client = clientMap[to];
   const businessName = client?.businessName || 'the business';
+  const clientId = client?.clientId || 'unknown';
 
   try {
     const contact = await findContact(from);
     const consentStatus = contact?.fields?.consent_status;
     const now = new Date().toISOString();
 
-    // Already opted out — ignore everything
-    if (consentStatus === 'opted_out') {
-      console.log(`${from} is opted out — ignoring message`);
-      return;
-    }
-
-    // STOP — always honored, no matter their current status
+    // STOP — always honored first, no matter what
     if (message === 'STOP' || message === 'UNSUBSCRIBE') {
-      await sendSMS(to, from, `${businessName}: You have been unsubscribed and will receive no further messages.`);
+      const stopReply = `${businessName}: You have been unsubscribed and will receive no further messages. Text START anytime to opt back in.`;
+      await sendSMS(to, from, stopReply);
+      await logConversation(from, to, clientId, 'inbound', messageRaw);
+      await logConversation(from, to, clientId, 'outbound', stopReply);
       if (contact) {
         await updateContact(contact.id, {
           consent_status: 'opted_out',
@@ -227,10 +255,38 @@ app.post('/sms', async (req, res) => {
       return;
     }
 
+    // START / UNSTOP — re-opt-in if they were previously opted out
+    if (message === 'START' || message === 'UNSTOP') {
+      const reOptInReply = `${businessName}: You have been re-subscribed and will receive messages again. Reply STOP at any time to opt out.`;
+      await sendSMS(to, from, reOptInReply);
+      await logConversation(from, to, clientId, 'inbound', messageRaw);
+      await logConversation(from, to, clientId, 'outbound', reOptInReply);
+      if (contact) {
+        await updateContact(contact.id, {
+          consent_status: 'opted_in',
+          opted_in_at: now,
+          last_message_at: now
+        });
+      }
+      console.log(`${from} re-opted in`);
+      return;
+    }
+
+    // Already opted out and didn't send START/UNSTOP — ignore everything
+    if (consentStatus === 'opted_out') {
+      console.log(`${from} is opted out — ignoring message`);
+      return;
+    }
+
+    // Log every other inbound message to Conversations
+    await logConversation(from, to, clientId, 'inbound', messageRaw);
+
     // HELP — only respond if they're opted in
     if (message === 'HELP') {
       if (consentStatus === 'opted_in') {
-        await sendSMS(to, from, `${businessName}: For assistance, contact us at hello@streamlineaihq.com. Reply STOP to opt out.`);
+        const helpReply = `${businessName}: For assistance, contact us at hello@streamlineaihq.com. Reply STOP to opt out.`;
+        await sendSMS(to, from, helpReply);
+        await logConversation(from, to, clientId, 'outbound', helpReply);
         if (contact) {
           await updateContact(contact.id, { last_message_at: now });
         }
@@ -238,9 +294,11 @@ app.post('/sms', async (req, res) => {
       return;
     }
 
-    // YES / START — opt them in (only if they were pending)
-    if ((message === 'YES' || message === 'START') && consentStatus === 'pending') {
-      await sendSMS(to, from, `${businessName}: You're now opted in. Message frequency varies. Msg & data rates may apply. Reply HELP for assistance or STOP to opt out. — How can we help you today?`);
+    // YES — opt them in (only if they were pending)
+    if (message === 'YES' && consentStatus === 'pending') {
+      const optInReply = `${businessName}: You're now opted in. Message frequency varies. Msg & data rates may apply. Reply HELP for assistance or STOP to opt out. — How can we help you today?`;
+      await sendSMS(to, from, optInReply);
+      await logConversation(from, to, clientId, 'outbound', optInReply);
       await updateContact(contact.id, {
         consent_status: 'opted_in',
         opted_in_at: now,
