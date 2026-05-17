@@ -5,13 +5,13 @@ app.use(express.json());
 const AIRTABLE_API_KEY = process.env.AIRTABLE_API_KEY;
 const AIRTABLE_BASE_ID = process.env.AIRTABLE_BASE_ID;
 const TELNYX_API_KEY = process.env.TELNYX_API_KEY;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 const clientMap = {
   '+19714356058': {
     clientId: 'client_001',
     businessName: 'StreamlineAI',
     businessPhone: '+19717626038',
-    aiContext: 'You are a helpful assistant for StreamlineAI.'
   }
 };
 
@@ -103,6 +103,57 @@ async function sendSMS(from, to, text) {
   return await res.json();
 }
 
+// ── AI helpers ────────────────────────────────────────────────────
+
+async function getClientContext(clientId) {
+  const formula = encodeURIComponent(`{client_id}="${clientId}"`);
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/Clients?filterByFormula=${formula}&maxRecords=1`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` }
+  });
+  const data = await res.json();
+  return data.records?.[0]?.fields?.ai_context || null;
+}
+
+async function getConversationHistory(callerPhone, clientId) {
+  const formula = encodeURIComponent(`AND({caller_phone}="${callerPhone}",{client_id}="${clientId}")`);
+  const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/Conversations?filterByFormula=${formula}&sort[0][field]=timestamp&sort[0][direction]=asc`;
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` }
+  });
+  const data = await res.json();
+  return data.records || [];
+}
+
+async function getAIReply(aiContext, conversationHistory, latestMessage) {
+  const messages = [];
+
+  for (const record of conversationHistory) {
+    const role = record.fields.direction === 'outbound' ? 'assistant' : 'user';
+    messages.push({ role, content: record.fields.message });
+  }
+
+  messages.push({ role: 'user', content: latestMessage });
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-5',
+      max_tokens: 1024,
+      system: `You are a helpful assistant responding to customers via SMS on behalf of a business. Keep replies conversational and concise — this is a text message conversation. Do not use bullet points or long formatted lists. Only answer based on the information provided to you. If you do not know the answer to something, say so honestly and let the customer know a team member will follow up. Never invent information, prices, or promises.\n\nBusiness context:\n\n${aiContext}`,
+      messages
+    })
+  });
+
+  const data = await res.json();
+  return data.content?.[0]?.text || null;
+}
+
 // ── Call webhook ──────────────────────────────────────────────────
 
 app.post('/call', async (req, res) => {
@@ -160,11 +211,9 @@ app.post('/call', async (req, res) => {
         const consentStatus = contact?.fields?.consent_status;
 
         if (consentStatus === 'opted_out') {
-          // Opted out — send nothing
           console.log(`${caller} is opted out — no text sent`);
 
         } else if (consentStatus === 'opted_in') {
-          // Already have consent — skip the consent ask, go straight to help
           const shortMsg = `Hi, this is ${callClient.businessName}. Sorry we missed your call — how can we help you today?`;
           await sendSMS(telnyxNumber, caller, shortMsg);
           textSent = true;
@@ -173,7 +222,6 @@ app.post('/call', async (req, res) => {
           await updateContact(contact.id, { last_message_at: new Date().toISOString() });
 
         } else {
-          // No record or pending — send full consent request
           const consentMsg = `Hi, this is ${callClient.businessName}. Sorry we missed your call — can we follow up with you here by text? Reply YES to continue or STOP to opt out. Text START anytime to opt back in.`;
           await sendSMS(telnyxNumber, caller, consentMsg);
           textSent = true;
@@ -207,7 +255,6 @@ app.post('/sms', async (req, res) => {
   res.sendStatus(200);
   const eventType = req.body?.data?.event_type;
 
-  // Only process actual inbound messages, ignore outbound status webhooks (message.sent, message.finalized)
   if (eventType !== 'message.received') {
     console.log(`Ignoring SMS event: ${eventType}`);
     return;
@@ -221,14 +268,12 @@ app.post('/sms', async (req, res) => {
 
   console.log(`Inbound SMS from ${from} to ${to}: ${messageRaw}`);
 
-  // Ignore messages sent from our own Telnyx numbers (outbound echo)
   const ownNumbers = Object.keys(clientMap);
   if (ownNumbers.includes(from)) {
     console.log(`Ignoring echo from own Telnyx number ${from}`);
     return;
   }
 
-  // Look up which client owns the Telnyx number this text was sent to
   const client = clientMap[to];
   const businessName = client?.businessName || 'the business';
   const clientId = client?.clientId || 'unknown';
@@ -238,7 +283,6 @@ app.post('/sms', async (req, res) => {
     const consentStatus = contact?.fields?.consent_status;
     const now = new Date().toISOString();
 
-    // STOP — always honored first, no matter what
     if (message === 'STOP' || message === 'UNSUBSCRIBE') {
       await logConversation(from, to, clientId, 'inbound', messageRaw);
       if (contact) {
@@ -252,7 +296,6 @@ app.post('/sms', async (req, res) => {
       return;
     }
 
-    // START / UNSTOP — re-opt-in if they were previously opted out
     if (message === 'START' || message === 'UNSTOP') {
       const reOptInReply = `${businessName}: You have been re-subscribed and will receive messages again. Reply STOP at any time to opt out.`;
       await sendSMS(to, from, reOptInReply);
@@ -269,16 +312,13 @@ app.post('/sms', async (req, res) => {
       return;
     }
 
-    // Already opted out and didn't send START/UNSTOP — ignore everything
     if (consentStatus === 'opted_out') {
       console.log(`${from} is opted out — ignoring message`);
       return;
     }
 
-    // Log every other inbound message to Conversations
     await logConversation(from, to, clientId, 'inbound', messageRaw);
 
-    // HELP — only respond if they're opted in
     if (message === 'HELP') {
       if (consentStatus === 'opted_in') {
         const helpReply = `${businessName}: For assistance, contact us at hello@streamlineaihq.com. Reply STOP to opt out.`;
@@ -291,7 +331,6 @@ app.post('/sms', async (req, res) => {
       return;
     }
 
-    // YES — opt them in (only if they were pending)
     if (message === 'YES' && consentStatus === 'pending') {
       const optInReply = `${businessName}: You're now opted in. Message frequency varies. Msg & data rates may apply. Reply HELP for assistance or STOP to opt out. — How can we help you today?`;
       await sendSMS(to, from, optInReply);
@@ -305,22 +344,35 @@ app.post('/sms', async (req, res) => {
       return;
     }
 
-    // Pending but didn't reply YES/STOP — do nothing per 10DLC registration
     if (consentStatus === 'pending') {
       console.log(`${from} is pending — message was not YES/STOP, no reply sent`);
       return;
     }
 
-    // Opted in — this is where the AI chatbot will eventually respond
+    // Opted in — Claude AI chatbot responds
     if (consentStatus === 'opted_in') {
-      console.log(`${from} is opted in — AI chatbot reply goes here (not yet built)`);
-      if (contact) {
+      try {
+        const aiContext = await getClientContext(clientId);
+        if (!aiContext) {
+          console.log(`No AI context found for ${clientId} — skipping AI reply`);
+          return;
+        }
+        const history = await getConversationHistory(from, clientId);
+        const aiReply = await getAIReply(aiContext, history, messageRaw);
+        if (!aiReply) {
+          console.log('Claude returned no reply');
+          return;
+        }
+        await sendSMS(to, from, aiReply);
+        await logConversation(from, to, clientId, 'outbound', aiReply);
         await updateContact(contact.id, { last_message_at: now });
+        console.log(`AI reply sent to ${from}: ${aiReply}`);
+      } catch (err) {
+        console.error('AI chatbot error:', err?.message);
       }
       return;
     }
 
-    // No contact record and message isn't a recognized keyword — ignore
     console.log(`Unknown contact ${from} sent: ${messageRaw} — ignored`);
 
   } catch (err) {
