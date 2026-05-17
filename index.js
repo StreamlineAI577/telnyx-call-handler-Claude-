@@ -174,7 +174,7 @@ app.post('/call', async (req, res) => {
 
         } else {
           // No record or pending — send full consent request
-          const consentMsg = `Hi, this is ${callClient.businessName}. Sorry we missed your call — can we follow up with you here by text? Reply YES to continue or STOP to opt out.`;
+          const consentMsg = `Hi, this is ${callClient.businessName}. Sorry we missed your call — can we follow up with you here by text? Reply YES to continue or STOP to opt out. Text START anytime to opt back in.`;
           await sendSMS(telnyxNumber, caller, consentMsg);
           textSent = true;
           console.log(`Consent request sent to ${caller}`);
@@ -240,10 +240,7 @@ app.post('/sms', async (req, res) => {
 
     // STOP — always honored first, no matter what
     if (message === 'STOP' || message === 'UNSUBSCRIBE') {
-      const stopReply = `${businessName}: You have been unsubscribed and will receive no further messages. Text START anytime to opt back in.`;
-      await sendSMS(to, from, stopReply);
       await logConversation(from, to, clientId, 'inbound', messageRaw);
-      await logConversation(from, to, clientId, 'outbound', stopReply);
       if (contact) {
         await updateContact(contact.id, {
           consent_status: 'opted_out',
