@@ -170,6 +170,7 @@ app.post('/call', async (req, res) => {
 
   if (eventType === 'call.initiated' && direction === 'incoming') {
     if (!client) { console.log('No client found for number:', calledNumber); return; }
+    if (clientMap[callerNumber]) { console.log('Ignoring loop call from own Telnyx number:', callerNumber); return; }
     activeCalls[callControlId] = { client, callerNumber, telnyxNumber: calledNumber, answered: false, answeredAt: null };
     console.log(`Incoming call for ${client.businessName} from ${callerNumber}`);
     try {
