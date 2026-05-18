@@ -143,7 +143,7 @@ async function getAIReply(aiContext, conversationHistory, latestMessage) {
       'anthropic-version': '2023-06-01'
     },
     body: JSON.stringify({
-      model: 'claude-sonnet-4-5',
+      model: 'claude-sonnet-4-6',
       max_tokens: 1024,
       system: `You are a helpful assistant responding to customers via SMS on behalf of a business. Keep replies conversational and concise — this is a text message conversation. Do not use bullet points or long formatted lists. Only answer based on the information provided to you. If you do not know the answer to something, say so honestly and let the customer know a team member will follow up. Never invent information, prices, or promises.\n\nBusiness context:\n\n${aiContext}`,
       messages
