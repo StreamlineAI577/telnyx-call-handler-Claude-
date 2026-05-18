@@ -167,11 +167,15 @@ app.post('/call', async (req, res) => {
   const callControlId = payload?.call_control_id;
   const direction = payload?.direction;
   const client = clientMap[calledNumber];
+  console.log('RAW PAYLOAD:', JSON.stringify(payload));
 
   if (eventType === 'call.initiated' && direction === 'incoming') {
     if (!client) { console.log('No client found for number:', calledNumber); return; }
-    if (clientMap[callerNumber]) { console.log('Ignoring loop call from own Telnyx number:', callerNumber); return; }
-    activeCalls[callControlId] = { client, callerNumber, telnyxNumber: calledNumber, answered: false, answeredAt: null };
+    const recentCall = Object.values(activeCalls).find(
+      c => c.callerNumber === callerNumber && (Date.now() - c.startedAt) < 10000
+    );
+    if (recentCall) { console.log('Ignoring duplicate call from:', callerNumber); return; }
+    activeCalls[callControlId] = { client, callerNumber, telnyxNumber: calledNumber, answered: false, answeredAt: null, startedAt: Date.now() };
     console.log(`Incoming call for ${client.businessName} from ${callerNumber}`);
     try {
       const response = await fetch(`https://api.telnyx.com/v2/calls/${callControlId}/actions/transfer`, {
