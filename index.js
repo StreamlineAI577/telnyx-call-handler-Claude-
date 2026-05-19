@@ -17,9 +17,6 @@ const clientMap = {
   }
 };
 
-const POST_ANSWER_MISSED_THRESHOLD_SECONDS = 10;
-const activeCalls = {};
-
 // ── Airtable helpers ──────────────────────────────────────────────
 
 async function findContact(phoneNumber) {
@@ -59,7 +56,7 @@ async function updateContact(recordId, fields) {
   return await res.json();
 }
 
-async function logCall(callerPhone, telnyxNumber, clientId, status, durationSeconds, textSent) {
+async function logCall(callerPhone, telnyxNumber, clientId, textSent) {
   const res = await fetch(`https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/Call%20Log`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}`, 'Content-Type': 'application/json' },
@@ -69,8 +66,8 @@ async function logCall(callerPhone, telnyxNumber, clientId, status, durationSeco
         caller_phone: callerPhone,
         client_telnyx_number: telnyxNumber,
         client_id: clientId,
-        call_status: status,
-        call_duration_seconds: durationSeconds || 0,
+        call_status: 'missed',
+        call_duration_seconds: 0,
         text_sent: textSent
       }
     })
@@ -101,6 +98,15 @@ async function sendSMS(from, to, text) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TELNYX_API_KEY}` },
     body: JSON.stringify({ from, to, text })
+  });
+  return await res.json();
+}
+
+async function rejectCall(callControlId) {
+  const res = await fetch(`https://api.telnyx.com/v2/calls/${callControlId}/actions/reject`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TELNYX_API_KEY}` },
+    body: JSON.stringify({})
   });
   return await res.json();
 }
@@ -167,92 +173,66 @@ app.post('/call', async (req, res) => {
   const callControlId = payload?.call_control_id;
   const direction = payload?.direction;
   const client = clientMap[calledNumber];
-  console.log('RAW PAYLOAD:', JSON.stringify(payload));
 
   if (eventType === 'call.initiated' && direction === 'incoming') {
-    if (!client) { console.log('No client found for number:', calledNumber); return; }
-    const recentCall = Object.values(activeCalls).find(
-      c => c.callerNumber === callerNumber && (Date.now() - c.startedAt) < 10000
-    );
-    if (recentCall) { console.log('Ignoring duplicate call from:', callerNumber); return; }
-    activeCalls[callControlId] = { client, callerNumber, telnyxNumber: calledNumber, answered: false, answeredAt: null, startedAt: Date.now() };
-    console.log(`Incoming call for ${client.businessName} from ${callerNumber}`);
-    try {
-      const response = await fetch(`https://api.telnyx.com/v2/calls/${callControlId}/actions/transfer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TELNYX_API_KEY}` },
-        body: JSON.stringify({ to: client.businessPhone, from: callerNumber, timeout_secs: 60 })
-      });
-      const result = await response.json();
-      console.log('Transfer response:', JSON.stringify(result));
-    } catch (err) { console.error('Transfer failed:', err?.message); }
-  }
-
-  if (eventType === 'call.answered') {
-    if (activeCalls[callControlId]) {
-      activeCalls[callControlId].answered = true;
-      activeCalls[callControlId].answeredAt = Date.now();
-      console.log(`Call answered for leg ${callControlId}`);
+    if (!client) {
+      console.log('No client found for number:', calledNumber);
+      return;
     }
-  }
 
-  if (eventType === 'call.hangup') {
-    const callData = activeCalls[callControlId];
-    if (!callData) return;
-    const { client: callClient, callerNumber: caller, telnyxNumber, answered, answeredAt } = callData;
+    console.log(`Missed call for ${client.businessName} from ${callerNumber}`);
 
-    let postAnswerSeconds = null;
-    if (answered && answeredAt) { postAnswerSeconds = (Date.now() - answeredAt) / 1000; }
+    // Reject the call immediately — it's already missed (carrier forwarded it because client didn't answer)
+    try {
+      await rejectCall(callControlId);
+      console.log('Call rejected');
+    } catch (err) {
+      console.error('Reject failed:', err?.message);
+    }
 
-    const wasMissed = !answered || (postAnswerSeconds !== null && postAnswerSeconds < POST_ANSWER_MISSED_THRESHOLD_SECONDS);
-    const callStatus = wasMissed ? 'missed' : 'answered';
-    const durationSeconds = postAnswerSeconds ? Math.round(postAnswerSeconds) : 0;
-
-    console.log(`Call ended | status: ${callStatus}`);
-
+    // Send text and log
     let textSent = false;
+    try {
+      const contact = await findContact(callerNumber);
+      const consentStatus = contact?.fields?.consent_status;
 
-    if (wasMissed) {
-      try {
-        const contact = await findContact(caller);
-        const consentStatus = contact?.fields?.consent_status;
+      if (consentStatus === 'opted_out') {
+        console.log(`${callerNumber} is opted out — no text sent`);
 
-        if (consentStatus === 'opted_out') {
-          console.log(`${caller} is opted out — no text sent`);
+      } else if (consentStatus === 'opted_in') {
+        const shortMsg = `Hi, this is ${client.businessName}. Sorry we missed your call — how can we help you today?`;
+        await sendSMS(calledNumber, callerNumber, shortMsg);
+        textSent = true;
+        console.log(`Short missed call text sent to ${callerNumber} (already opted in)`);
+        await logConversation(callerNumber, calledNumber, client.clientId, 'outbound', shortMsg);
+        await updateContact(contact.id, { last_message_at: new Date().toISOString() });
 
-        } else if (consentStatus === 'opted_in') {
-          const shortMsg = `Hi, this is ${callClient.businessName}. Sorry we missed your call — how can we help you today?`;
-          await sendSMS(telnyxNumber, caller, shortMsg);
-          textSent = true;
-          console.log(`Short missed call text sent to ${caller} (already opted in)`);
-          await logConversation(caller, telnyxNumber, callClient.clientId, 'outbound', shortMsg);
-          await updateContact(contact.id, { last_message_at: new Date().toISOString() });
+      } else {
+        const consentMsg = `Hi, this is ${client.businessName}. Sorry we missed your call — can we follow up with you here by text? Reply YES to continue or STOP to opt out. Text START anytime to opt back in.`;
+        await sendSMS(calledNumber, callerNumber, consentMsg);
+        textSent = true;
+        console.log(`Consent request sent to ${callerNumber}`);
+        await logConversation(callerNumber, calledNumber, client.clientId, 'outbound', consentMsg);
 
+        if (!contact) {
+          await createContact(callerNumber, calledNumber, client.clientId);
         } else {
-          const consentMsg = `Hi, this is ${callClient.businessName}. Sorry we missed your call — can we follow up with you here by text? Reply YES to continue or STOP to opt out. Text START anytime to opt back in.`;
-          await sendSMS(telnyxNumber, caller, consentMsg);
-          textSent = true;
-          console.log(`Consent request sent to ${caller}`);
-          await logConversation(caller, telnyxNumber, callClient.clientId, 'outbound', consentMsg);
-
-          if (!contact) {
-            await createContact(caller, telnyxNumber, callClient.clientId);
-          } else {
-            await updateContact(contact.id, {
-              consent_status: 'pending',
-              consent_requested_at: new Date().toISOString(),
-              last_message_at: new Date().toISOString()
-            });
-          }
+          await updateContact(contact.id, {
+            consent_status: 'pending',
+            consent_requested_at: new Date().toISOString(),
+            last_message_at: new Date().toISOString()
+          });
         }
-      } catch (err) { console.error('Missed call handling error:', err?.message); }
+      }
+    } catch (err) {
+      console.error('Missed call handling error:', err?.message);
     }
 
     try {
-      await logCall(caller, telnyxNumber, callClient.clientId, callStatus, durationSeconds, textSent);
-    } catch (err) { console.error('Call log error:', err?.message); }
-
-    delete activeCalls[callControlId];
+      await logCall(callerNumber, calledNumber, client.clientId, textSent);
+    } catch (err) {
+      console.error('Call log error:', err?.message);
+    }
   }
 });
 
