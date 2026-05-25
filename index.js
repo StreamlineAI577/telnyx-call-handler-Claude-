@@ -66,8 +66,6 @@ async function logCall(callerPhone, telnyxNumber, clientId, textSent) {
         caller_phone: callerPhone,
         client_telnyx_number: telnyxNumber,
         client_id: clientId,
-        call_status: 'missed',
-        call_duration_seconds: 0,
         text_sent: textSent
       }
     })
