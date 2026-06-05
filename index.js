@@ -206,6 +206,17 @@ app.post('/call', async (req, res) => {
         await updateContact(contact.id, { last_message_at: new Date().toISOString() });
 
       } else {
+        // Cooldown check: if already pending and a consent request was sent within the last 24 hours, skip
+        if (contact?.fields?.consent_status === 'pending' && contact?.fields?.consent_requested_at) {
+          const lastSent = new Date(contact.fields.consent_requested_at);
+          const hoursSince = (Date.now() - lastSent.getTime()) / (1000 * 60 * 60);
+          if (hoursSince < 24) {
+            console.log(`Consent request already sent to ${callerNumber} ${Math.floor(hoursSince)}h ago — skipping`);
+            await logCall(callerNumber, calledNumber, client.clientId, false);
+            return;
+          }
+        }
+
         const consentMsg = `Hi, this is ${client.businessName}. Sorry we missed your call — can we follow up with you here by text? Reply YES to continue or STOP to opt out. Text START anytime to opt back in.`;
         await sendSMS(calledNumber, callerNumber, consentMsg);
         textSent = true;
@@ -317,7 +328,7 @@ app.post('/sms', async (req, res) => {
     }
 
     if (message === 'YES' && consentStatus === 'pending') {
-      const optInReply = `${businessName}: You're now opted in. Message frequency varies. Msg & data rates may apply. Reply HELP for assistance or STOP to opt out. — How can we help you today?`;
+      const optInReply = `${businessName}: You're now opted in. Message frequency varies. Msg & data rates may apply. Reply HELP for assistance or STOP to opt out. — You're now chatting with an AI assistant. How can we help you today?`;
       await sendSMS(to, from, optInReply);
       await logConversation(from, to, clientId, 'outbound', optInReply);
       await updateContact(contact.id, {
