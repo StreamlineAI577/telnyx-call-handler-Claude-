@@ -14,6 +14,11 @@ const clientMap = {
     clientId: 'client_001',
     businessName: 'StreamlineAI',
     businessPhone: '+19717626038',
+  },
+  '+19714161313': {
+    clientId: 'client_002',
+    businessName: 'ABC Plumbing',
+    businessPhone: '+15038959336',
   }
 };
 
