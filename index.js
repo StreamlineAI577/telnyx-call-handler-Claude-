@@ -24,8 +24,8 @@ const clientMap = {
 
 // ── Airtable helpers ──────────────────────────────────────────────
 
-async function findContact(phoneNumber) {
-  const formula = encodeURIComponent(`{phone_number}="${phoneNumber}"`);
+async function findContact(phoneNumber, clientId) {
+  const formula = encodeURIComponent(`AND({phone_number}="${phoneNumber}",{client_id}="${clientId}")`);
   const url = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/SMS%20Contacts?filterByFormula=${formula}&maxRecords=1`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${AIRTABLE_API_KEY}` }
@@ -196,7 +196,7 @@ app.post('/call', async (req, res) => {
     // Send text and log
     let textSent = false;
     try {
-      const contact = await findContact(callerNumber);
+      const contact = await findContact(callerNumber, client.clientId);
       const consentStatus = contact?.fields?.consent_status;
 
       if (consentStatus === 'opted_out') {
@@ -280,7 +280,7 @@ app.post('/sms', async (req, res) => {
   const clientId = client?.clientId || 'unknown';
 
   try {
-    const contact = await findContact(from);
+    const contact = await findContact(from, clientId);
     const consentStatus = contact?.fields?.consent_status;
     const now = new Date().toISOString();
 
